@@ -56,8 +56,9 @@
 
 /*! @file
     @ingroup LTC6813-1
-*/
 
+(x-2.5)*(1/66.7)=I  -30~30
+(x-2.5)*(1/5.7)=I -350~350*/
 /************************************* Read me *******************************************
 In this sketch book:
   -All Global Variables are in Upper casing
@@ -79,6 +80,7 @@ In this sketch book:
 #include <Timer.h>
 #include <stdint.h>
 #include <mcp_can.h>
+#include <SD.h>
 /************************* Defines *****************************/
 #define ENABLED 1
 #define DISABLED 0
@@ -127,7 +129,7 @@ char get_char(void);
   Setup Variables
   The following variables can be modified to configure the software.
 ********************************************************************/
-const uint8_t TOTAL_IC = 5; //!< Number of ICs in the daisy chain
+const uint8_t TOTAL_IC = 6; //!< Number of ICs in the daisy chain
 
 /********************************************************************
  ADC Command Configurations. See LTC681x.h for options
@@ -193,10 +195,12 @@ Timer update_vol;
 /*Customize Global Variable*********************************************/
 bool start_discharge = false;
 bool start_balance = false;
+bool shutdown_status = true;
 bool discharge_stat[TOTAL_IC][18] = {false};
-int num_of_finish = 0;
+
 double vmin[TOTAL_IC];
 double vmax[TOTAL_IC];
+double diff[TOTAL_IC];
 
 double consvmax[TOTAL_IC] = {0};
 double consvmin[TOTAL_IC];
@@ -204,23 +208,35 @@ double consvmin[TOTAL_IC];
 double avgvol[TOTAL_IC];
 double sumvol[TOTAL_IC];
 
-bool shutdown_status = true;
-bool start_canbus=false;
+int num_of_finish = 0;
 
-const int SPI_CS_PIN1 = 9;    //can_bus_parameter
+/*//////can_bus_parameter/////////*/
+const int SPI_CS_PIN1 = 9;
 MCP_CAN CAN(SPI_CS_PIN1);
-unsigned char msg[8] = {0,0,0,0,0,0,0,0};
 int num=0,count_ic=0;
 unsigned int low_total=0;
 unsigned int high_total=0;
+unsigned char msg[8] = {0,0,0,0,0,0,0,0};
+int j=0;
+int output_error[8]= {0,0,0,0,0,0,0,0};
+unsigned char emergency_error[8]= {0,0,0,0,0,0,0,0};
+/*//////////canId/////
+0~5 send
+6,7 send(info)
+8   receive
+9   dangerous(occupied)*/
 
-/**************************************************************************/
+/*//////// SD card /////////*/
+File myFile;
+const int chipSelect = 8;
+int e=0;
+/********************Setup()***************************/
 
 void setup()
 {
   Serial.begin(115200);
   quikeval_SPI_connect();
-  spi_enable(SPI_CLOCK_DIV16); // This will set the Linduino to have a 1MHz Clock
+  spi_enable(SPI_CLOCK_DIV16);              // This will set the Linduino to have a 1MHz Clock
   LTC6813_init_cfg(TOTAL_IC, BMS_IC);
   LTC6813_init_cfgb(TOTAL_IC, BMS_IC);
   for (uint8_t current_ic = 0; current_ic < TOTAL_IC; current_ic++)
@@ -231,15 +247,15 @@ void setup()
   LTC6813_reset_crc_count(TOTAL_IC, BMS_IC);
   LTC6813_init_reg_limits(TOTAL_IC, BMS_IC);
   print_menu();
-  for (int i = 0; i < 18; i++)
+  for (int i = 0; i < 18; i++)            //Initialize the variable array
   {
     vmin[i] = 5;
     consvmax[i] = 5;
   }
-  stat_print.every(2000, starttowork);
-  update_vol.every(500, voltage_update);
-
-  //clear all discharge
+  //stat_print.every(2000, starttowork);    // Starttowork (loop routine/2s) : 1.calculate min and MAX of cell/ICs 2.Printout the Info. of Cell 3.check if start balance
+  update_vol.every(500, voltage_update);  //voltage_update(loop routine/500ms):1.Renew the min and MAX of cell/ICs 2.Send message to the CAN bus 3.check the error_avg.
+  
+  //clear all discharge before the Reset
   wakeup_sleep(TOTAL_IC);
   LTC6813_clear_discharge(TOTAL_IC,BMS_IC);
   LTC6813_wrcfg(TOTAL_IC,BMS_IC);
@@ -252,12 +268,9 @@ void setup()
         delay(100);
   }
   Serial.println("CAN BUS Shield init ok!");*/
-  
   pinMode(13, OUTPUT);
 }
-
 /**********************************Start of Customize Function*******************************/
-
 
 void voltage_update() // update voltage per 500ms
 {
@@ -280,25 +293,29 @@ void voltage_update() // update voltage per 500ms
       }
       avgvol[j] = sumvol[j] / 18;
     }
-    start_canbus=true;
-    if (start_canbus)
+    //Maximum();    
+    //Minimum();
+    //error_average();
+    //error_difference();
+    //emergency();
+    /*if(CAN_MSGAVAIL == CAN.checkReceive())            // check if data coming
     {
-      send_msg_canbus();
-    }
-    else{
-      Maximum();
-    }
-    Minimum();
+      unsigned char len = 0;
+      unsigned char buff[8];
+      CAN.readMsgBuf(&len, buff);    // read data,  len: data length, buf: data buf
+      delay(20);
+      unsigned long canId = CAN.getCanId();
+      if(canId==8){
+        send_msg_canbus();
+      }
+    }*/
+    //SD_save();
 }
 
 void starttowork()
 {
   wakeup_sleep(TOTAL_IC);
   LTC6813_adcv(ADC_CONVERSION_MODE, ADC_DCP, CELL_CH_TO_CONVERT);
-  //Serial.print(F("AOV :"));
-  //run_command('AOV');
-  //print_avgofvoltage();
-  //print_sumofcells();
   run_command(92);
   Serial.println();
   Serial.println();
@@ -308,22 +325,30 @@ void starttowork()
     Serial.print(current_ic + 1);
     Serial.print(F(" : "));
     Serial.print(sumvol[current_ic],4);
-    Serial.print(F("   "));
+    Serial.print(F(",   "));
     Serial.print(F("Average voltage of IC "));
     Serial.print(current_ic + 1);
     Serial.print(F(" : "));
-    Serial.println(avgvol[current_ic],4);
+    Serial.print(avgvol[current_ic],4);
+    Serial.println(F(",   "));
     Serial.print(F("MAX difference Voltage_"));
     Serial.print(F("IC "));
     Serial.print(current_ic + 1);
     Serial.print(F(" : "));
     Serial.print(vmax[current_ic] - vmin[current_ic], 4);
-    Serial.print(F("   "));
+    Serial.print(F(",   "));
     Serial.print(F("Highest Voltage:"));
     Serial.print(vmax[current_ic], 4);
-    Serial.print(F("   "));
+    Serial.print(F(",   "));
     Serial.print(F("Lowest Voltage:"));
-    Serial.println(vmin[current_ic], 4);
+    Serial.print(vmin[current_ic], 4);
+    Serial.print(F(",   "));
+    Serial.print(F("Total Current:"));
+    Serial.print(vmax[current_ic], 4);
+    Serial.print(F(",   "));
+    Serial.print(F(":"));
+    Serial.print(vmin[current_ic], 4);
+    Serial.println(F(",   "));
   }
   print_cells(DATALOG_DISABLED);
   if (start_balance)
@@ -359,15 +384,13 @@ void moniV() // Every loop will Check out the Dischaerging cell is lower than th
     {
       if (BMS_IC[current_ic].cells.c_codes[i] * 0.0001 < consvmin[current_ic])
       {
-        //Serial.println(consvmin[current_ic]);
         wakeup_sleep(TOTAL_IC);
         LTC6813_clear_custom2_discharge(i + 1, current_ic, TOTAL_IC, BMS_IC);
         LTC6813_wrcfg(TOTAL_IC, BMS_IC);
         LTC6813_wrcfgb(TOTAL_IC, BMS_IC);
-        discharge_stat[current_ic][i] = false;
-        
+        discharge_stat[current_ic][i] = false;                 // Finish the Discharge        
       }
-      finish = finish && !(discharge_stat[current_ic][i]);
+      finish = finish && !(discharge_stat[current_ic][i]);    //Have to compare the finish for all finish == True that Discharged finish
       Serial.print("C");
       Serial.print(i);
       Serial.print(":");
@@ -387,7 +410,7 @@ void battery_charge_balance()
 {
   uint32_t conv_time = 0;
   int8_t error = 0;
-  double charge_buffer = 0;
+  double chargeBias_buffer = 0;
   int light;
   wakeup_sleep(TOTAL_IC);
   LTC6813_adcv(ADC_CONVERSION_MODE, ADC_DCP, CELL_CH_TO_CONVERT);
@@ -399,15 +422,14 @@ void battery_charge_balance()
   for (int current_ic = 0; current_ic < TOTAL_IC; current_ic++)
   {
     light = 0;
-    charge_buffer = 0;
+    chargeBias_buffer = 0;
     for (int i = 0; i < BMS_IC[0].ic_reg.cell_channels; i++)
     {
       if (light > 2)
       {
-        charge_buffer = 0.05;
+        chargeBias_buffer = 0.05;
       }
-      //Serial.println(BMS_IC[current_ic].stat.stat_codes[0] * 0.0001 * 30/18+0.05+charge_buffer,4);
-      if (BMS_IC[current_ic].cells.c_codes[i] * 0.0001 > BMS_IC[current_ic].stat.stat_codes[0] * 0.0001 * 30 / 18 + 0.05 + charge_buffer)
+      if (BMS_IC[current_ic].cells.c_codes[i] * 0.0001 > BMS_IC[current_ic].stat.stat_codes[0] * 0.0001 * 30 / 18 + 0.05 + chargeBias_buffer)
       {
         light = light + 1;
         wakeup_sleep(TOTAL_IC);
@@ -434,6 +456,7 @@ void Maximum()
     {
       Serial.println(F("Over Voltage > 3.73 !"));
       shutdown_status = false;
+      output_error[0]=1;
     }
   }
 }
@@ -446,35 +469,39 @@ void Minimum()
     {
       Serial.println(F("Under Voltage < 2.5 !"));
       shutdown_status = false;
+      output_error[1]=1;
     }
   }
 }
-/*void sorting(cell_asic *BMS_IC)
-{
-  double temp = 0;
+
+void error_average(){
   for (int current_ic = 0; current_ic < TOTAL_IC; current_ic++)
   {
-    for (int i = 0; i < 18; i++)
+    if (vmax[current_ic] > avgvol[current_ic]+0.2)
     {
-      BMS_compare[current_ic].cells.c_codes[i] = BMS_IC[current_ic].cells.c_codes[i];
+      Serial.println(F("Over Average Voltage !"));
+      //shutdown_status = false;
+      output_error[2]=1;
     }
-
-    for (int i = 0; i < 18; i++)
+    if (vmin[current_ic] < avgvol[current_ic]-0.2)
     {
-
-      for (int j = 0; j < i; j++)
-      {
-        if (BMS_compare[current_ic].cells.c_codes[j + 1] > BMS_compare[current_ic].cells.c_codes[j])
-        {
-          temp = BMS_compare[current_ic].cells.c_codes[j + 1];
-          BMS_compare[current_ic].cells.c_codes[j + 1] = BMS_compare[current_ic].cells.c_codes[j];
-          BMS_compare[current_ic].cells.c_codes[j] = temp;
-        }
-      }
+      Serial.println(F("Under Average Voltage !"));
+      //shutdown_status = false;
+      output_error[3]=1;
     }
   }
-}*/
-
+}
+void error_difference(){
+  for (int current_ic = 0; current_ic < TOTAL_IC; current_ic++)
+  {
+    if (vmax[current_ic] - vmin[current_ic] > 0.4)
+    {
+      Serial.println(F("Over maximum Voltage difference !"));
+      //shutdown_status = false;
+      output_error[4]=1;
+    }
+  }
+}
 /*/////can_bus///////////*/
 void bit_transform(unsigned int a){
   low_total=a%256;
@@ -504,29 +531,149 @@ void msg_assign(){
   }
 }
 void send_msg_canbus() {
-  for(count_ic=0;count_ic<TOTAL_IC;count_ic++){
-    int k=0;
-    for(int i=0;i<6;i++){
-      for(num=0;num<4;num++){
-        bit_transform(BMS_IC[count_ic].cells.c_codes[k]);
-        msg_assign();
-        if(num==3){}
-        else{
-          k+=1;
+  for(int j=0;j<2;j++){
+    send_msg_data();
+    for(count_ic=0;count_ic<TOTAL_IC;count_ic++){
+      int k=0;
+      for(int i=0;i<6;i++){
+        for(num=0;num<4;num++){
+          bit_transform(BMS_IC[count_ic].cells.c_codes[k]);
+          msg_assign();
+          if(num==3){}
+          else{
+            k+=1;
+          }
         }
+        /*for(int i=0;i<8;i++){
+          Serial.print(msg[i]);
+          Serial.print("  ");
+        }
+        Serial.println();*/
+        CAN.sendMsgBuf(i, 0, 8, msg);
+        delay(20);
       }
-      /*for(int i=0;i<8;i++){
-        Serial.print(msg[i]);
-        Serial.print("  ");
-      }
-      Serial.println();*/
-      CAN.sendMsgBuf(i, 0, 8, msg);
-      delay(50);
     }
   }
-  start_canbus=false;
 }
+void send_msg_data(){
+  int l=0;
+  for(count_ic=0;count_ic<TOTAL_IC;count_ic++){
+    diff[count_ic]=vmax[count_ic] - vmin[count_ic];
+  }
+  /*Serial.println(diff[0]*1000);
+  Serial.println();*/
+  for(count_ic=0;count_ic<TOTAL_IC;count_ic++){
+    num=0;
+      bit_transform(sumvol[count_ic]*1000);  //0,1
+      msg_assign();
+    num=1;
+      bit_transform(avgvol[count_ic]*10000); //2,3
+      msg_assign();
+    num=2;  
+      bit_transform(diff[count_ic]*10000);   //4,5
+      msg_assign();
+      msg[6]=count_ic+1;
+      msg[7]=0;
+      CAN.sendMsgBuf(6, 0, 8, msg);
+      delay(20);
+    num=0;  
+      bit_transform(vmax[count_ic]*10000);   //0,1
+      msg_assign();
+    num=1;  
+      bit_transform(vmin[count_ic]*10000);   //2,3
+      msg_assign();
+      msg[4]=0;
+      msg[5]=0;
+      msg[6]=count_ic+1;
+      msg[7]=0;
+      
+      /*for(int i=0;i<8;i++){
+      Serial.print(msg[i]);
+      Serial.print("  ");
+      }
+      Serial.println();*/
+      CAN.sendMsgBuf(7, 0, 8, msg);
+      delay(20);
+  }
+}
+void emergency(){
+  for(int i=0;i<8;i++){
+    if(output_error[i]==1){
+      emergency_error[i]=1;
+      CAN.sendMsgBuf(9, 0, 8, emergency_error);
+      delay(20);
+      output_error[i]=0;
+    }
+  }
+}
+/*/////////////SD card////////////////*/
+void SD_save(){
+  Serial.print("\nWaiting for SD card ready...");
+  if (!SD.begin(4)) {
+    Serial.println("Fail!");
+    return;
+  }
+  Serial.println("Success!");
 
+  myFile = SD.open("BMS.txt", FILE_WRITE);       // 開啟檔案，一次僅能開啟一個檔案
+  if (myFile) {                                   // 假使檔案開啟正常
+    for (int current_ic = 0; current_ic < TOTAL_IC; current_ic++){
+      myFile.print(F("Sum voltage of IC "));
+      myFile.print(current_ic + 1);
+      myFile.print(F(" : "));
+      myFile.print(sumvol[current_ic],4);
+      myFile.print(F(",   "));
+      myFile.print(F("Average voltage of IC "));
+      myFile.print(current_ic + 1);
+      myFile.print(F(" : "));
+      myFile.print(avgvol[current_ic],4);
+      myFile.println(F(",   "));
+      myFile.print(F("MAX difference Voltage_"));
+      myFile.print(F("IC "));
+      myFile.print(current_ic + 1);
+      myFile.print(F(" : "));
+      myFile.print(vmax[current_ic] - vmin[current_ic], 4);
+      myFile.print(F(",   "));
+      myFile.print(F("Highest Voltage:"));
+      myFile.print(vmax[current_ic], 4);
+      myFile.print(F(",   "));
+      myFile.print(F("Lowest Voltage:"));
+      myFile.print(vmin[current_ic], 4);
+      myFile.println(F(",   "));
+    }
+    for (int current_ic = 0; current_ic < TOTAL_IC; current_ic++)
+    {
+        myFile.print("IC ");
+        myFile.print(current_ic + 1, DEC);
+        myFile.print(",");
+        for (int i = 0; i < BMS_IC[0].ic_reg.cell_channels; i++)
+        {
+          myFile.print(" C");
+          myFile.print(i + 1, DEC);
+          myFile.print(":");
+          myFile.print(BMS_IC[current_ic].cells.c_codes[i] * 0.0001, 4);
+          myFile.print(",");
+        }
+        myFile.println();
+    }
+    Serial.println("\n");
+    myFile.close();                               // 關閉檔案
+  } 
+  else {
+    Serial.println("\n open file error ");    // 無法開啟時顯示錯誤
+  }
+  
+  /*myFile = SD.open("BMS.txt");
+  if (myFile) {                               //判斷檔案是否存在
+    while (myFile.available()) {              // 若還有可讀取的資料
+      Serial.write(myFile.read());
+    }
+    myFile.close();                           //關閉檔案
+  }
+  else {
+    Serial.println("error opening BMS.txt");
+  }*/
+}
 /***************************************End of Customize Function****************************/
 
 /*!*********************************************************************
@@ -553,10 +700,6 @@ void loop()
   update_vol.update();
   //delay(1000);
   
-  SPI.begin();    //can_bus
-  quikeval_SPI_connect();
-  spi_enable(SPI_CLOCK_DIV16); // This will set the Linduino to have a 1MHz Clock
-  
   if(shutdown_status)
   {
     digitalWrite(13, HIGH);
@@ -565,6 +708,9 @@ void loop()
   {
     digitalWrite(13, LOW);
   }
+  SPI.begin();
+  quikeval_SPI_connect();
+  spi_enable(SPI_CLOCK_DIV16);              // This will set the Linduino to have a 1MHz Clock
 }
 
 /*!*****************************************
@@ -639,6 +785,45 @@ void run_command(uint32_t cmd)
     print_rxconfigb();
     break;
 
+  case 24: //clear discharge of seleted cell of all ICs
+    s_pin_read = select_s_pin();
+    wakeup_sleep(TOTAL_IC);
+    LTC6813_clear_custom_discharge(s_pin_read, TOTAL_IC, BMS_IC);
+    LTC6813_wrcfg(TOTAL_IC, BMS_IC);
+    LTC6813_wrcfgb(TOTAL_IC, BMS_IC);
+    //print_wrconfig();
+    //print_wrconfigb();
+    wakeup_idle(TOTAL_IC);
+    error = LTC6813_rdcfg(TOTAL_IC, BMS_IC);
+    check_error(error);
+    error = LTC6813_rdcfgb(TOTAL_IC, BMS_IC);
+    check_error(error);
+    //print_rxconfig();
+    //print_rxconfigb();
+    break;
+
+  case 28: // Read byte data I2C Communication on the GPIO Ports(using eeprom 24AA01)
+      wakeup_sleep(TOTAL_IC);
+        /************************************************************
+         Communication control bits and communication data bytes. 
+         Refer to the data sheet. 
+      *************************************************************/   
+      for (uint8_t current_ic = 0; current_ic<TOTAL_IC;current_ic++) 
+      {      
+        BMS_IC[current_ic].com.tx_data[0]= 0x6A; // Icom(6)Start + I2C_address D0 (1010 0000)
+        BMS_IC[current_ic].com.tx_data[1]= 0x10; // Fcom master ack 
+        BMS_IC[current_ic].com.tx_data[2]= 0x60; // again start I2C with I2C_address (1010 0001)
+        BMS_IC[current_ic].com.tx_data[3]= 0x19; // fcom master nack + stop 
+      }          
+      LTC6813_wrcomm(TOTAL_IC,BMS_IC);
+      wakeup_idle(TOTAL_IC);              
+      //LTC6813_stcomm();// I2C for write data in slave device    
+      LTC6813_pollAdc();
+      error = LTC6813_rdcomm(TOTAL_IC,BMS_IC); // Read comm register                 
+      check_error(error);
+      print_rxcomm(); // Print comm register   
+      break;
+    
   case 'm': //prints menu
     print_menu();
     break;
@@ -666,9 +851,8 @@ void run_command(uint32_t cmd)
     check_error(error);                                  //Check error to enable the function
     for (int i = 0; i < TOTAL_IC; i++)
     {
-      consvmin[i] = vmin[i];
+      consvmin[i] = vmin[i];                             //Set up a costant Vminimum in case of the minumum become lower and lower
     }
-    //Serial.println(consvmin[current_ic], 4);
     for (int current_ic = 0; current_ic < TOTAL_IC; current_ic++)
     {
       for (int i = 0; i < BMS_IC[0].ic_reg.cell_channels; i++)
@@ -723,48 +907,32 @@ void run_command(uint32_t cmd)
     }
     break;
 
-  case 89: //clear discharge of seleted cell of all ICs
-    s_pin_read = select_s_pin();
-    wakeup_sleep(TOTAL_IC);
-    LTC6813_clear_custom_discharge(s_pin_read, TOTAL_IC, BMS_IC);
-    LTC6813_wrcfg(TOTAL_IC, BMS_IC);
-    LTC6813_wrcfgb(TOTAL_IC, BMS_IC);
-    //print_wrconfig();
-    //print_wrconfigb();
-    wakeup_idle(TOTAL_IC);
-    error = LTC6813_rdcfg(TOTAL_IC, BMS_IC);
-    check_error(error);
-    error = LTC6813_rdcfgb(TOTAL_IC, BMS_IC);
-    check_error(error);
-    //print_rxconfig();
-    //print_rxconfigb();
-    break;
-
-  case 90: //clear discharge of seleted cell of selected ICs
-    Serial.println("Clear Discharge !!");
-    s_ic = select_ic() - 1;
-    s_pin_read = select_s_pin();
-    wakeup_sleep(TOTAL_IC);
-    LTC6813_clear_custom2_discharge(s_pin_read, s_ic, TOTAL_IC, BMS_IC);
-    LTC6813_wrcfg(TOTAL_IC, BMS_IC);
-    LTC6813_wrcfgb(TOTAL_IC, BMS_IC);
-    //print_wrconfig();
-    //print_wrconfigb();
-    wakeup_idle(TOTAL_IC);
-    error = LTC6813_rdcfg(TOTAL_IC, BMS_IC);
-    check_error(error);
-    error = LTC6813_rdcfgb(TOTAL_IC, BMS_IC);
-    check_error(error);
-    //print_rxconfig();
-    //print_rxconfigb();
-    break;
-
-  case 91: //set discharge of seleted cell of selected ICs
+  
+  case 90: //set discharge of seleted cell of selected ICs
     Serial.println(F("Set Discharge !!"));
     s_ic = select_ic() - 1;
     s_pin_read = select_s_pin();
     wakeup_sleep(TOTAL_IC);
     LTC6813_set_custom_discharge(s_pin_read, s_ic, TOTAL_IC, BMS_IC);
+    LTC6813_wrcfg(TOTAL_IC, BMS_IC);
+    LTC6813_wrcfgb(TOTAL_IC, BMS_IC);
+    //print_wrconfig();
+    //print_wrconfigb();
+    wakeup_idle(TOTAL_IC);
+    error = LTC6813_rdcfg(TOTAL_IC, BMS_IC);
+    check_error(error);
+    error = LTC6813_rdcfgb(TOTAL_IC, BMS_IC);
+    check_error(error);
+    //print_rxconfig();
+    //print_rxconfigb();
+    break;
+    
+  case 91: //clear discharge of seleted cell of selected ICs
+    Serial.println("Clear Discharge !!");
+    s_ic = select_ic() - 1;
+    s_pin_read = select_s_pin();
+    wakeup_sleep(TOTAL_IC);
+    LTC6813_clear_custom2_discharge(s_pin_read, s_ic, TOTAL_IC, BMS_IC);
     LTC6813_wrcfg(TOTAL_IC, BMS_IC);
     LTC6813_wrcfgb(TOTAL_IC, BMS_IC);
     //print_wrconfig();
@@ -796,10 +964,10 @@ void run_command(uint32_t cmd)
         vmin[j] > BMS_IC[j].cells.c_codes[i] * 0.0001 ? vmin[j] = BMS_IC[j].cells.c_codes[i] * 0.0001 : 1;
         vmax[j] < BMS_IC[j].cells.c_codes[i] * 0.0001 ? vmax[j] = BMS_IC[j].cells.c_codes[i] * 0.0001 : 1;
       }
-      Serial.print(F("min : "));
+      /*Serial.print(F("min : "));
       Serial.print(vmin[j], 4);
       Serial.print(F("  max : "));
-      Serial.println(vmax[j], 4);
+      Serial.println(vmax[j], 4);*/
     }
 
     break;
